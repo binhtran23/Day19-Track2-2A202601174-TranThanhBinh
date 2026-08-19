@@ -2,6 +2,11 @@
 # jupyter:
 #   jupytext:
 #     formats: py:percent
+#     text_representation:
+#       extension: .py
+#       format_name: percent
+#       format_version: '1.3'
+#       jupytext_version: 1.19.5
 # ---
 
 # %% [markdown]
@@ -63,13 +68,17 @@ for h in body["hits"][:3]:
     print(f"  {h['doc_id']:>14}  score={h['score']:.4f}  {h['title']}")
 
 # %% [markdown]
-# ## 3. TODO — Latency benchmark (100 queries × 3 modes)
+# ## 3. Latency benchmark (100 queries × 3 modes)
 #
-# Dùng 50 golden queries × 2 reps = 100 calls/mode. Ghi nhận latency từ
-# `body["latency_ms"]` (server-side, đã trừ network) HOẶC từ wall-clock httpx
-# (bao gồm network) — note: rubric assert P99 < 50ms áp dụng cho server-side.
+# Dùng 50 golden queries × 2 reps = 100 calls/mode.
 #
-# Output: bảng P50/P95/P99 cho 3 mode.
+# **Design decision:** report cả server-side latency (`body["latency_ms"]`,
+# đã trừ network — dùng để **gate** rubric assertion P99 < 50ms) và wall-clock
+# httpx latency (bao gồm network — context cho trải nghiệm client thật, không
+# assert). Percentile dùng linear-interpolation (`statistics.quantiles`) thay
+# vì nearest-rank — với N=100 samples, nearest-rank có thể lệch vài ms ở đúng
+# vị trí P99 mà ta đang assert. Chạy 10 warm-up queries trước khi đo để loại
+# cold-start effect (model chưa warm, connection pool chưa mở).
 
 # %%
 import json
@@ -79,13 +88,22 @@ golden = [json.loads(l) for l in (DATA / "golden_set.jsonl").open(encoding="utf-
 
 
 def percentile(values: list[float], p: float) -> float:
-    n = len(values)
-    if n == 0:
+    if not values:
         return 0.0
-    return sorted(values)[min(int(n * p), n - 1)]
+    if len(values) < 2:
+        return values[0]
+    quantiles = statistics.quantiles(values, n=100, method="inclusive")
+    idx = min(max(round(p * 100), 1), 99) - 1
+    return quantiles[idx]
+
+
+def warm_up(mode: str, n: int = 10) -> None:
+    for q in golden[:n]:
+        httpx.get(f"{URL}/search", params={"q": q["query"], "mode": mode})
 
 
 def benchmark_mode(mode: str, reps: int = 2) -> dict[str, float]:
+    warm_up(mode)
     server_latencies: list[float] = []
     wall_latencies: list[float] = []
     for _ in range(reps):
@@ -98,17 +116,19 @@ def benchmark_mode(mode: str, reps: int = 2) -> dict[str, float]:
         "p50_server": percentile(server_latencies, 0.50),
         "p95_server": percentile(server_latencies, 0.95),
         "p99_server": percentile(server_latencies, 0.99),
+        "p50_wall":   percentile(wall_latencies, 0.50),
+        "p95_wall":   percentile(wall_latencies, 0.95),
         "p99_wall":   percentile(wall_latencies, 0.99),
     }
 
 
-print(f"  {'mode':10}  {'P50':>7}  {'P95':>7}  {'P99':>7}  {'P99(wall)':>9}")
+print(f"  {'mode':10}  {'P50':>7}  {'P95':>7}  {'P99':>7}  |  {'P50(wall)':>9}  {'P95(wall)':>9}  {'P99(wall)':>9}")
 results = {}
 for mode in ("keyword", "semantic", "hybrid"):
     res = benchmark_mode(mode)
     results[mode] = res
     print(f"  {mode:10}  {res['p50_server']:>5.1f}ms  {res['p95_server']:>5.1f}ms  "
-          f"{res['p99_server']:>5.1f}ms  {res['p99_wall']:>7.1f}ms")
+          f"{res['p99_server']:>5.1f}ms  |  {res['p50_wall']:>7.1f}ms  {res['p95_wall']:>7.1f}ms  {res['p99_wall']:>7.1f}ms")
 
 # %% [markdown]
 # ## 4. Rubric assertion — hybrid P99 server-side < 50ms

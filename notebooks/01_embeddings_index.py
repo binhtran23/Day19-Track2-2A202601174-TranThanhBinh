@@ -2,6 +2,11 @@
 # jupyter:
 #   jupytext:
 #     formats: py:percent
+#     text_representation:
+#       extension: .py
+#       format_name: percent
+#       format_version: '1.3'
+#       jupytext_version: 1.19.5
 # ---
 
 # %% [markdown]
@@ -79,24 +84,28 @@ client.create_collection(
 # **Hint:** xem `app/search.py` `_build_vector_index()` để tham khảo pattern.
 
 # %%
-# TODO: implement the embed + upsert loop here.
+# Design decision: stream-upsert per batch rather than accumulate all 1000
+# PointStructs and issue one final upsert. Keeps peak memory bounded to one
+# batch and gives progress feedback as the corpus grows past 1000 docs.
 # Expected outcome: client.count("lab19") == 1000
 # (~30 seconds on first run as fastembed downloads the model.)
 
 BATCH = 64
-points: list[PointStruct] = []
 for start in range(0, len(docs), BATCH):
     batch = docs[start:start + BATCH]
     texts = [d["title"] + " " + d["text"] for d in batch]
     vectors = list(embedder.embed(texts))
-    for i, (d, v) in enumerate(zip(batch, vectors)):
-        points.append(PointStruct(
+    points = [
+        PointStruct(
             id=start + i,
             vector=v.tolist(),
             payload={"doc_id": d["doc_id"], "topic": d["topic"], "title": d["title"]},
-        ))
+        )
+        for i, (d, v) in enumerate(zip(batch, vectors))
+    ]
+    client.upsert(collection_name="lab19", points=points)
+    print(f"  upserted batch {start // BATCH + 1}: docs {start}-{start + len(batch) - 1}")
 
-client.upsert(collection_name="lab19", points=points)
 n_indexed = client.count(collection_name="lab19").count
 print(f"Indexed: {n_indexed} vectors")
 assert n_indexed == 1000, f"expected 1000 indexed, got {n_indexed}"

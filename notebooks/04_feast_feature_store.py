@@ -2,6 +2,11 @@
 # jupyter:
 #   jupytext:
 #     formats: py:percent
+#     text_representation:
+#       extension: .py
+#       format_name: percent
+#       format_version: '1.3'
+#       jupytext_version: 1.19.5
 # ---
 
 # %% [markdown]
@@ -147,7 +152,16 @@ print(f"Single lookup: {single_latency_ms:.2f}ms")
 print({k: v[0] for k, v in features.items()})
 
 # %% [markdown]
-# ## 5. TODO — Batch latency benchmark (100 lookups, P99)
+# ## 5. Batch latency benchmark (100 lookups, P99)
+#
+# **Design decision:** gate P99 < 10ms trên **single-entity-per-call** lookups
+# (100 separate calls, mỗi call 1 user) — đây là pattern serving thực tế: một
+# request search-time đến với 1 user tại 1 thời điểm, bạn không biết trước
+# 100 users để gộp thành 1 batch call. Batched call (1 call cho cả 100 users)
+# đo throughput amortized — hữu ích cho batch scoring offline (vd. nightly
+# re-rank), nhưng KHÔNG dùng để gate rubric vì nó không đại diện cho serving
+# latency thật (per-call overhead như SQLite connection/serialization không
+# được amortize trong production single-request path).
 
 # %%
 latencies: list[float] = []
@@ -164,7 +178,7 @@ latencies.sort()
 p50 = latencies[50]
 p95 = latencies[95]
 p99 = latencies[99]
-print(f"Online lookup latency over 100 calls:")
+print(f"Online lookup latency over 100 single-entity calls:")
 print(f"  P50 = {p50:.2f}ms")
 print(f"  P95 = {p95:.2f}ms")
 print(f"  P99 = {p99:.2f}ms")
@@ -175,6 +189,27 @@ else:
     print(f"WARN — P99 = {p99:.2f}ms (SQLite trên macOS thường tốt hơn 5ms; Linux thường tốt hơn 1ms)")
 
 # %% [markdown]
+# ### 5b. Batched throughput (reported, not gated)
+#
+# Một call duy nhất cho cả 100 users — đo amortized per-lookup cost khi
+# gộp batch. So sánh với single-call P99 ở trên để thấy chênh lệch giữa
+# "per-request serving" vs "batch offline scoring".
+
+# %%
+batch_entity_rows = [{"user_id": f"u_{i:03d}"} for i in range(100)]
+t0 = time.perf_counter()
+fs.get_online_features(
+    features=REQUEST_FEATURES,
+    entity_rows=batch_entity_rows,
+).to_dict()
+batch_total_ms = (time.perf_counter() - t0) * 1000
+batch_per_lookup_ms = batch_total_ms / len(batch_entity_rows)
+
+print(f"Batched call (100 entities, 1 call): total={batch_total_ms:.2f}ms, "
+      f"amortized per-lookup={batch_per_lookup_ms:.3f}ms")
+print(f"  (context only — NOT used for the P99<10ms rubric gate above)")
+
+# %% [markdown]
 # ## 6. PIT join (offline) — đảm bảo no data leakage
 #
 # `get_historical_features` thực hiện Point-in-Time join: cho mỗi event row
@@ -182,10 +217,17 @@ else:
 # Đây là cơ chế chính để tránh training-serving skew (deck §6).
 
 # %%
+# Query timestamps must be >= each user's own feature event_timestamp
+# (u_{i:03d} has event_timestamp = NOW - timedelta(hours=i % 48), so u_001's
+# feature snapshot is at NOW-1h, u_002's at NOW-2h, u_003's at NOW-3h).
+# Querying further in the past than a user's feature timestamp means no
+# feature value existed yet at that point in time, and PIT join correctly
+# drops that row — querying with a 1h margin under each user's own
+# timestamp keeps all 3 rows valid while still varying the query time.
 import pandas as pd
 entity_df = pd.DataFrame({
     "user_id": ["u_001", "u_002", "u_003"],
-    "event_timestamp": [NOW - timedelta(hours=2), NOW - timedelta(hours=1), NOW],
+    "event_timestamp": [NOW - timedelta(hours=0), NOW - timedelta(hours=1), NOW - timedelta(hours=2)],
 })
 
 historical = fs.get_historical_features(
